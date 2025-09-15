@@ -13,7 +13,6 @@ def fetch_prices(ticker: str, start: str, end: str) -> pd.Series:
     df = yf.download(ticker, start=start, end=end, auto_adjust=True, progress=False)
     if df.empty:
         raise RuntimeError(f"No data for {ticker} between {start} and {end}")
-    # Prefer 'Adj Close' if present, else 'Close'
     if 'Adj Close' in df.columns:
         ser = df['Adj Close'].copy()
     else:
@@ -25,10 +24,6 @@ def is_leap_year(y: int) -> bool:
     return calendar.isleap(y)
 
 def month_based_dates(year: int, n: int) -> List[pd.Timestamp]:
-    """
-    If n <= 12: pick up to n month-starts roughly evenly spaced.
-    Implementation: months = floor(i * 12 / n) + 1 for i in 0..n-1 (dedupe).
-    """
     months = []
     for i in range(n):
         m = int(math.floor(i * 12.0 / n)) + 1
@@ -38,15 +33,9 @@ def month_based_dates(year: int, n: int) -> List[pd.Timestamp]:
     return dates
 
 def day_based_dates(year: int, n: int) -> List[pd.Timestamp]:
-    """
-    If n > 12: produce n dates evenly spaced across the year's calendar days.
-    Use day's offsets from Jan 1. Round to nearest integer offset to pick a date.
-    """
     days_in_year = 366 if is_leap_year(year) else 365
-    # Generate N positions across [0, days_in_year-1]
     positions = np.linspace(0, days_in_year - 1, n)
-    offsets = np.rint(positions).astype(int)   # round to nearest day offset
-    # make unique and create timestamps
+    offsets = np.rint(positions).astype(int)
     offsets = np.unique(offsets)
     dates = [pd.Timestamp(year=year, month=1, day=1) + pd.Timedelta(days=int(d)) for d in offsets]
     return dates
@@ -60,10 +49,6 @@ def generate_buy_dates_for_year(year: int, n: int) -> List[pd.Timestamp]:
         return day_based_dates(year, n)
 
 def get_next_trading_day_index(index: pd.DatetimeIndex, dt: pd.Timestamp):
-    """
-    Return integer index in 'index' for the first trading day >= dt.
-    If none, return None.
-    """
     pos = index.searchsorted(dt)
     if pos >= len(index):
         return None
@@ -71,26 +56,21 @@ def get_next_trading_day_index(index: pd.DatetimeIndex, dt: pd.Timestamp):
 
 def simulate_for_buys_per_year(prices: pd.Series, start_year: int, end_year: int,
                                buys_per_year: int, annual_investment: float) -> dict:
-    """
-    Run DCA sim for a single buys_per_year across all years start_year..end_year inclusive.
-    """
     idx = prices.index
     total_shares = 0.0
     total_invested = 0.0
     total_trades = 0
+    trades = []  # 매수 기록 저장
 
     for year in range(start_year, end_year + 1):
         raw_dates = generate_buy_dates_for_year(year, buys_per_year)
-        # ensure only dates within that calendar year
         raw_dates = [d for d in raw_dates if d.year == year]
         if len(raw_dates) == 0:
             continue
-        # actual per-buy amount: split annual_investment equally across the number of buys in that year
         per_buy_amount = annual_investment / len(raw_dates)
         for buy_dt in raw_dates:
             pos = get_next_trading_day_index(idx, buy_dt)
             if pos is None:
-                # no later trading day inside our price series for that date; skip
                 continue
             trade_dt = idx[pos]
             price = float(prices.iloc[pos])
@@ -98,19 +78,20 @@ def simulate_for_buys_per_year(prices: pd.Series, start_year: int, end_year: int
             total_shares += shares
             total_invested += per_buy_amount
             total_trades += 1
+            trades.append({
+                "date": trade_dt.strftime("%Y-%m-%d"),
+                "price": price,
+                "invested": per_buy_amount,
+                "shares": shares
+            })
 
-    # find final price at 2025-01-01 or next trading day
     final_target = pd.Timestamp("2025-01-01")
     pos_final = get_next_trading_day_index(prices.index, final_target)
-    # if not in our current prices (we fetch up to 2025-01-10 in main), pos_final should exist; but fallback:
     if pos_final is None:
-        # try to fetch a small future window
         future = yf.download(prices.name, start="2025-01-01", end="2025-01-15", auto_adjust=True, progress=False)
         if future is None or future.empty:
             raise RuntimeError("Cannot determine final trading day in early 2025 for final valuation.")
-        # append to prices temporarily (we'll take the first index from future)
         future_ser = future['Close'] if 'Close' in future.columns else future.iloc[:,0]
-        # convert to same name
         future_ser.name = prices.name
         combined = pd.concat([prices, future_ser])
         combined = combined[~combined.index.duplicated(keep='first')].sort_index()
@@ -132,12 +113,12 @@ def simulate_for_buys_per_year(prices: pd.Series, start_year: int, end_year: int
         'profit': profit,
         'roi_pct': roi,
         'final_date': final_date.strftime("%Y-%m-%d"),
-        'total_trades': total_trades
+        'total_trades': total_trades,
+        'trades': trades  # 매수 기록 반환
     }
 
 def run_all(annual_investment: float, start_year: int = 2004, end_year: int = 2024,
             min_buys: int = 1, max_buys: int = 365, ticker: str = "SPY", export_csv: str = None):
-    # Fetch price series from 2004-01-01 up to early 2025 to ensure final day lookup
     prices = fetch_prices(ticker, start=f"{start_year}-01-01", end="2025-01-15")
     results = []
     print(f"Running simulations for buys_per_year = {min_buys}..{max_buys} (annual_investment=${annual_investment:,.2f})")
@@ -145,12 +126,23 @@ def run_all(annual_investment: float, start_year: int = 2004, end_year: int = 20
         res = simulate_for_buys_per_year(prices, start_year, end_year, n, annual_investment)
         results.append(res)
     df = pd.DataFrame(results)
-    # sort by final_value descending
     df_sorted = df.sort_values(by='final_value', ascending=False).reset_index(drop=True)
-    # show top 20 by default
+
     pd.set_option('display.float_format', lambda x: f'{x:,.2f}')
     print("\nTop 20 strategies by final value (2025-01-01 기준):")
     print(df_sorted.head(20)[['buys_per_year','total_invested','final_value','profit','roi_pct','total_trades','final_date']].to_string(index=False))
+
+    # 상위 3개 전략의 상세 매수 기록 출력
+    print("\n=== Top 3 Strategies Detailed Buy Logs ===")
+    for i in range(3):
+        strategy = results[df_sorted.index[i]]
+        print(f"\n--- Strategy Rank {i+1}: buys_per_year = {strategy['buys_per_year']} ---")
+        print(f"Total Invested: ${strategy['total_invested']:,.2f}, Final Value: ${strategy['final_value']:,.2f}, ROI: {strategy['roi_pct']:.2f}%")
+        trade_df = pd.DataFrame(strategy['trades'])
+        print(trade_df.head(10).to_string(index=False))  # 너무 길어지지 않게 앞부분 10개만 출력
+        if len(trade_df) > 10:
+            print(f"... ({len(trade_df)-10} more trades)")
+
     if export_csv:
         df_sorted.to_csv(export_csv, index=False)
         print(f"\nAll results saved to: {export_csv}")
